@@ -1,68 +1,23 @@
---[[
-===============================================================================
-  SKC V3 · AutoExecute 載入器（金鑰 + 秒注入）
-===============================================================================
-
-  安裝：把「這個檔案」放進執行器的 autoexec 資料夾就好。
-
-  流程：
-    1. 金鑰驗證 —— 第一次會跳出輸入框，驗證通過後記在 workspace/SKCV3/key.txt，
-       之後開遊戲自動驗證，不用再輸入。金鑰失效時會再跳出輸入框。
-    2. 秒注入 —— 等遊戲真的準備好才往下走。AutoExecute 執行的時間點太早，
-       那時候跑大量程式碼、掛 hook 會把客戶端凍住，所以這裡只做輕量輪詢，
-       每次之間都 task.wait 讓出執行緒。
-    3. 本體 —— 向伺服器出示金鑰換取本體，本體不公開，沒有金鑰拿不到。
-===============================================================================
-]]
-
-local WORKER_URL      = "https://skinchanger-hwid.smallvmware.workers.dev"
-local DATA_FOLDER     = "SKCV3"
-local KEY_FILE        = "SKCV3/key.txt"
-local GAME_ID         = 6035872082  -- RIVALS
-local READY_TIMEOUT   = 120
-local POST_READY_WAIT = 10
-
--- 冷開機（剛打開 Roblox）跟傳送（打完一場回大廳）需要的緩衝差很多。
--- 用檔案時間戳記分辨，不用 getgenv（部分執行器的 getgenv 身分不穩定）。
-local WARM_SETTLE         = 3
-local COLD_SETTLE         = 12
-local WARM_WINDOW_SECONDS = 90
-local BOOT_STAMP_FILE     = "SKCV3/boot_stamp.txt"
+local WORKER_URL = "https://skinchanger-hwid.smallvmware.workers.dev"
+local KEY_FILE   = "SKCV3/key.txt"
+local GAME_ID    = 6035872082
 
 local has_fs = type(isfile) == "function" and type(readfile) == "function"
     and type(writefile) == "function"
 
-local http_request = request or http_request or (syn and syn.request)
+local http_request = (syn and syn.request) or request or http_request
+    or (http and http.request) or (fluxus and fluxus.request)
 
-local function log(msg) print("[SKC V3 Loader] " .. msg) end
+local function log(msg) print("[SKC V3] " .. msg) end
 
 local function ensure_folder()
     pcall(function()
         if type(isfolder) == "function" and type(makefolder) == "function"
-            and not isfolder(DATA_FOLDER) then
-            makefolder(DATA_FOLDER)
+            and not isfolder("SKCV3") then
+            makefolder("SKCV3")
         end
     end)
 end
-
-local settle = COLD_SETTLE
-if has_fs then
-    pcall(function()
-        ensure_folder()
-        local now = os.time()
-        if isfile(BOOT_STAMP_FILE) then
-            local last = tonumber(readfile(BOOT_STAMP_FILE))
-            if last and now >= last and (now - last) < WARM_WINDOW_SECONDS then
-                settle = WARM_SETTLE
-            end
-        end
-        writefile(BOOT_STAMP_FILE, tostring(now))
-    end)
-end
-
---=============================================================================
--- 伺服器溝通
---=============================================================================
 
 local function get_hwid()
     local ok, id = pcall(function()
@@ -73,14 +28,23 @@ local function get_hwid()
 end
 
 local function post(path, payload)
+    if not http_request then return nil, "no request() API" end
+
     local ok, res = pcall(http_request, {
-        Url = WORKER_URL .. path,
-        Method = "POST",
+        Url     = WORKER_URL .. path,
+        Method  = "POST",
         Headers = { ["Content-Type"] = "application/json" },
-        Body = game:GetService("HttpService"):JSONEncode(payload),
+        Body    = game:GetService("HttpService"):JSONEncode(payload),
     })
-    if not ok or type(res) ~= "table" then return nil, nil end
-    return res.StatusCode, res.Body
+    if not ok then return nil, "pcall: " .. tostring(res) end
+    if type(res) ~= "table" then return nil, "non-table response: " .. type(res) end
+
+    local status = res.StatusCode or res.Status or res.status_code or res.status
+    local body   = res.Body or res.body or res.data
+    if not status then return nil, "no status field (keys: " .. table.concat(
+        (function() local t={} for k in pairs(res) do t[#t+1]=tostring(k) end return t end)(), ",") .. ")" end
+
+    return status, body
 end
 
 local function decode(body)
@@ -101,8 +65,15 @@ local REASON_TEXT = {
 
 local function redeem(key, hwid)
     local status, body = post("/key/redeem", { key = key, hwid = hwid })
-    local data = status and decode(body)
-    if not data then return false, "network" end
+    if not status then
+        log("redeem HTTP fail: " .. tostring(body))
+        return false, "network"
+    end
+    local data = decode(body)
+    if not data then
+        log("redeem decode fail, status=" .. tostring(status) .. " body=" .. tostring(body):sub(1, 200))
+        return false, "network"
+    end
     if data.ok then return true end
     if data.reason == "expired" and data.expiresAt == nil then return false, "no_time" end
     return false, data.reason or "not_found"
@@ -122,15 +93,8 @@ end
 
 local function save_key(key)
     if not has_fs then return end
-    pcall(function()
-        ensure_folder()
-        writefile(KEY_FILE, key)
-    end)
+    pcall(function() ensure_folder(); writefile(KEY_FILE, key) end)
 end
-
---=============================================================================
--- 金鑰輸入框
---=============================================================================
 
 local function prompt_key(hwid, message)
     local gui = Instance.new("ScreenGui")
@@ -213,7 +177,7 @@ local function prompt_key(hwid, message)
         busy = true
         button.Text = "Checking..."
         status.TextColor3 = Color3.fromRGB(139, 144, 160)
-        status.Text = "Verifying key..."
+        status.Text = "Verifying..."
 
         local ok, reason = redeem(key, hwid)
         if ok then
@@ -235,62 +199,38 @@ local function prompt_key(hwid, message)
     return result
 end
 
---=============================================================================
--- 遊戲就緒判斷
---=============================================================================
-
-local function ready()
-    local ok, result = pcall(function()
-        if not game:IsLoaded() then return false end
-        local lp = game:GetService("Players").LocalPlayer
-        if not lp or not lp.Character then return false end
-        if time() < settle then return false end
-        return true
-    end)
-    return ok and result == true
-end
-
---=============================================================================
--- 主流程
---=============================================================================
-
-local LOADER_T0 = os.clock()
-local function elapsed() return ("+%.2fs"):format(os.clock() - LOADER_T0) end
-
 task.spawn(function()
-    -- 0. autoexec 每個遊戲都會跑，先確認是 RIVALS 再做任何事
-    local function loaded()
-        local ok, r = pcall(function()
-            return game:IsLoaded() and game:GetService("Players").LocalPlayer ~= nil
-        end)
-        return ok and r
+    if game.GameId ~= GAME_ID then
+        return warn("[SKC V3] Wrong game. Only works in RIVALS.")
     end
 
-    local deadline = os.clock() + READY_TIMEOUT
-    while not loaded() do
-        if os.clock() > deadline then return end
-        task.wait(0.5)
+    if not game:IsLoaded() then game.Loaded:Wait() end
+    local lp = game:GetService("Players").LocalPlayer
+    if not lp then
+        repeat task.wait() until game:GetService("Players").LocalPlayer
+        lp = game:GetService("Players").LocalPlayer
     end
-    if game.GameId ~= GAME_ID then return end
 
     if not http_request then
-        return warn("[SKC V3 Loader] 這個執行器不支援 request()，沒辦法驗證金鑰。")
+        return warn("[SKC V3] This executor has no request() API.")
     end
 
     local hwid = get_hwid()
     if not hwid then
-        return warn("[SKC V3 Loader] 拿不到裝置識別碼，沒辦法驗證金鑰。")
+        return warn("[SKC V3] Could not get hwid.")
     end
 
-    -- 1. 金鑰驗證
-    log("> 金鑰驗證（" .. elapsed() .. "）")
+    log("http_request type: " .. type(http_request))
+    log("hwid: " .. hwid:sub(1, 20) .. "...")
+
     local key = read_saved_key()
     local message
     if key then
+        log("trying saved key...")
         local ok, reason = redeem(key, hwid)
         if not ok then
             message = REASON_TEXT[reason] or tostring(reason)
-            log("已存的金鑰無效：" .. tostring(reason))
+            log("saved key invalid: " .. tostring(reason))
             key = nil
         end
     end
@@ -298,42 +238,20 @@ task.spawn(function()
         key = prompt_key(hwid, message)
         save_key(key)
     end
-    log("OK 金鑰驗證通過（" .. elapsed() .. "）")
+    log("OK key verified")
 
-    -- 2. 秒注入：等遊戲真的準備好
-    local ticks = 0
-    deadline = os.clock() + READY_TIMEOUT
-    while not ready() do
-        if os.clock() > deadline then
-            return warn(("[SKC V3 Loader] 等待遊戲就緒逾時（%ds），放棄自動載入。"):format(READY_TIMEOUT))
-        end
-        ticks += 1
-        task.wait(0.5)
-    end
-    log(("OK 遊戲就緒（%s，輪詢 %d 次，settle=%ds）"):format(elapsed(), ticks, settle))
-
-    if POST_READY_WAIT > 0 then
-        log(("> 就緒後再等 %ds..."):format(POST_READY_WAIT))
-        local wait_until = os.clock() + POST_READY_WAIT
-        while os.clock() < wait_until do task.wait(0.5) end
-    end
-
-    -- 3. 用金鑰換本體
-    log("> 下載本體（" .. elapsed() .. "）")
+    log("fetching body...")
     local status, body = post("/script", { key = key, hwid = hwid })
     if status ~= 200 or type(body) ~= "string" or #body == 0 then
-        local data = body and decode(body)
-        return warn("[SKC V3 Loader] 拿不到本體：" .. tostring(data and data.reason or status))
+        local data = type(body) == "string" and decode(body)
+        return warn("[SKC V3] Body unavailable: status=" .. tostring(status)
+            .. " reason=" .. tostring(data and data.reason or body))
     end
 
-    local chunk, compile_err = loadstring(body, "@SkinChanger.luau")
-    if not chunk then
-        return warn("[SKC V3 Loader] 本體編譯失敗：" .. tostring(compile_err))
-    end
+    local chunk, err = loadstring(body, "@SkinChanger.luau")
+    if not chunk then return warn("[SKC V3] Compile failed: " .. tostring(err)) end
 
-    log("> 開始執行本體（" .. elapsed() .. "）")
-    local ok_run, run_err = pcall(chunk)
-    if not ok_run then
-        warn("[SKC V3 Loader] 本體執行失敗：" .. tostring(run_err))
-    end
+    log("running body...")
+    local ok, err2 = pcall(chunk)
+    if not ok then warn("[SKC V3] Run failed: " .. tostring(err2)) end
 end)
